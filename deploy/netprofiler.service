@@ -1,0 +1,24 @@
+[Unit]
+Description=NetProfiler — Network Topology & Asset Profiling Web Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netprofiler
+Group=netprofiler
+WorkingDirectory=/opt/netprofiler
+EnvironmentFile=/etc/netprofiler.env
+ExecStart=/opt/netprofiler/.venv/bin/uvicorn app:app --host 0.0.0.0 --port ${NETPROFILER_PORT}
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/netprofiler
+
+[Install]
+WantedBy=multi-user.target
