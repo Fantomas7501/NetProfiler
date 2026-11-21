@@ -1,14 +1,15 @@
-"""NetProfiler Web Application — FastAPI backend with password auth, RBAC, and network profiling API."""
+"""NetProfiler Web Application — FastAPI backend with password auth, RBAC, multi-network management, and profiling API."""
 
 from __future__ import annotations
 
 import re
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -17,6 +18,7 @@ import auth
 import db
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{3,32}$")
 
 
@@ -29,7 +31,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="NetProfiler API",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -66,6 +68,30 @@ class UpdateUserRequest(BaseModel):
     is_active: Optional[bool] = None
     new_password: Optional[str] = Field(default=None, min_length=8, max_length=128)
     must_change_password: Optional[bool] = None
+
+
+class CreateNetworkRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=80)
+    cidr: str = Field(..., min_length=3, max_length=64)
+    description: str = Field(default="", max_length=300)
+    scan_interval_minutes: int = Field(default=60, ge=5, le=1440)
+    port_range: str = Field(default="top-1000", max_length=64)
+    nmap_flags: str = Field(default="-sV -O --version-intensity 5 -T4", max_length=160)
+    enabled: bool = True
+
+
+class UpdateNetworkRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=80)
+    cidr: Optional[str] = Field(default=None, min_length=3, max_length=64)
+    description: Optional[str] = Field(default=None, max_length=300)
+    scan_interval_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+    port_range: Optional[str] = Field(default=None, max_length=64)
+    nmap_flags: Optional[str] = Field(default=None, max_length=160)
+    enabled: Optional[bool] = None
+
+
+class TriggerScanRequest(BaseModel):
+    network_id: Optional[int] = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -354,7 +380,6 @@ def update_user(
         new_role = payload.role if payload.role is not None else target["role"]
         new_active = (1 if payload.is_active else 0) if payload.is_active is not None else target["is_active"]
 
-        # Guardrail: prevent removing or disabling the last active admin
         if target["role"] == "admin" and target["is_active"] == 1:
             if new_role != "admin" or new_active == 0:
                 if _count_active_admins(conn) <= 1:
@@ -363,7 +388,6 @@ def update_user(
                         detail="Impossible de rétrograder ou désactiver le dernier administrateur actif.",
                     )
 
-        # Guardrail: prevent admin from disabling their own active session account
         if user_id == admin["id"] and new_active == 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -436,20 +460,112 @@ def delete_user(
 
 
 # ---------------------------------------------------------------------------
+# Networks Management Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/networks")
+def api_list_networks(_user: dict[str, Any] = Depends(auth.get_current_user)) -> list[dict[str, Any]]:
+    return db.list_networks()
+
+
+@app.post("/api/networks", status_code=status.HTTP_201_CREATED)
+def api_create_network(
+    payload: CreateNetworkRequest,
+    _admin: dict[str, Any] = Depends(auth.require_admin),
+) -> dict[str, Any]:
+    try:
+        return db.create_network(
+            name=payload.name,
+            cidr=payload.cidr,
+            description=payload.description,
+            scan_interval_minutes=payload.scan_interval_minutes,
+            port_range=payload.port_range,
+            nmap_flags=payload.nmap_flags,
+            enabled=payload.enabled,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Format CIDR invalide : '{payload.cidr}'. Exemple attendu : 192.168.55.0/24.",
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Un réseau avec le sous-réseau '{payload.cidr}' existe déjà.",
+        )
+
+
+@app.put("/api/networks/{network_id}")
+def api_update_network(
+    network_id: int,
+    payload: UpdateNetworkRequest,
+    _admin: dict[str, Any] = Depends(auth.require_admin),
+) -> dict[str, Any]:
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    try:
+        updated = db.update_network(network_id, updates)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format CIDR invalide. Exemple attendu : 192.168.55.0/24.",
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ce sous-réseau CIDR est déjà configuré sur un autre réseau.",
+        )
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Réseau introuvable.")
+    return updated
+
+
+@app.delete("/api/networks/{network_id}")
+def api_delete_network(
+    network_id: int,
+    purge_history: bool = Query(default=False),
+    _admin: dict[str, Any] = Depends(auth.require_admin),
+) -> dict[str, Any]:
+    deleted = db.delete_network(network_id, purge_history=purge_history)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Réseau introuvable.")
+    return {"ok": True, "deleted_network_id": network_id, "history_preserved": not purge_history}
+
+
+@app.post("/api/networks/{network_id}/scan")
+def api_scan_network(
+    network_id: int,
+    user: dict[str, Any] = Depends(auth.get_current_user),
+) -> dict[str, Any]:
+    if user["role"] not in ("admin", "analyst"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Seuls les administrateurs et analystes peuvent déclencher un scan.",
+        )
+    if not db.get_network(network_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Réseau introuvable.")
+    new_session = db.trigger_network_scan(network_id=network_id)
+    return {"ok": True, "session": new_session}
+
+
+# ---------------------------------------------------------------------------
 # Network Scan & Asset Profiling Endpoints (Authenticated)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/sessions")
-def api_sessions(_user: dict[str, Any] = Depends(auth.get_current_user)) -> list[dict[str, Any]]:
-    return db.list_scan_sessions()
+def api_sessions(
+    network_id: Optional[int] = Query(default=None),
+    _user: dict[str, Any] = Depends(auth.get_current_user),
+) -> list[dict[str, Any]]:
+    return db.list_scan_sessions(network_id=network_id)
 
 
 @app.get("/api/data")
 def api_data(
     session_id: Optional[int] = Query(default=None),
+    network_id: Optional[int] = Query(default=None),
     _user: dict[str, Any] = Depends(auth.get_current_user),
 ) -> dict[str, Any]:
-    data = db.get_scan_data(session_id=session_id)
+    data = db.get_scan_data(session_id=session_id, network_id=network_id)
     if session_id is not None and data["session"] is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session de scan introuvable.")
     return data
@@ -459,22 +575,30 @@ def api_data(
 def api_asset_detail(
     ip: str,
     session_id: Optional[int] = Query(default=None),
+    network_id: Optional[int] = Query(default=None),
     _user: dict[str, Any] = Depends(auth.get_current_user),
 ) -> dict[str, Any]:
-    detail = db.get_asset_detail(ip=ip, session_id=session_id)
+    detail = db.get_asset_detail(ip=ip, session_id=session_id, network_id=network_id)
     if not detail:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Actif {ip} introuvable dans cette session.")
     return detail
 
 
 @app.post("/api/scan/trigger")
-def api_trigger_scan(user: dict[str, Any] = Depends(auth.get_current_user)) -> dict[str, Any]:
+def api_trigger_scan(
+    payload: Optional[TriggerScanRequest] = Body(default=None),
+    user: dict[str, Any] = Depends(auth.get_current_user),
+) -> dict[str, Any]:
     if user["role"] not in ("admin", "analyst"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Seuls les administrateurs et analystes peuvent déclencher un scan.",
         )
-    new_session = db.trigger_simulated_scan()
+    net_id = payload.network_id if payload else None
+    try:
+        new_session = db.trigger_network_scan(network_id=net_id)
+    except ValueError as err:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
     return {"ok": True, "session": new_session}
 
 
@@ -500,8 +624,7 @@ def api_update_config(
 # Static Frontend Routes
 # ---------------------------------------------------------------------------
 
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", include_in_schema=False)

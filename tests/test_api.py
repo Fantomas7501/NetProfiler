@@ -114,8 +114,13 @@ class NetProfilerAPITestCase(unittest.TestCase):
         self.assertTrue(body["authenticated"])
         self.assertEqual(body["user"]["role"], "admin")
 
-        # Sessions & data match original frontend contract
-        code, sessions = admin.request("GET", "/api/sessions")
+        # Networks & sessions match frontend contract
+        code, networks = admin.request("GET", "/api/networks")
+        self.assertEqual(code, 200)
+        self.assertGreaterEqual(len(networks), 3)
+        lan_net = next(n for n in networks if n["cidr"] == "192.168.10.0/24")
+
+        code, sessions = admin.request("GET", f"/api/sessions?network_id={lan_net['id']}")
         self.assertEqual(code, 200)
         self.assertGreaterEqual(len(sessions), 3)
 
@@ -219,6 +224,78 @@ class NetProfilerAPITestCase(unittest.TestCase):
         self.assertTrue(trig["ok"])
         code, after = admin.request("GET", "/api/sessions")
         self.assertEqual(len(after), len(before) + 1)
+
+    def test_05_multi_network_management_and_persistence(self) -> None:
+        admin = APIClient(self.base_url)
+        code, _ = admin.request("POST", "/api/auth/login", {"username": "admin", "password": "TestAdmin!2026"})
+        self.assertEqual(code, 200)
+
+        # Verify distinct networks have their own isolated assets in DB
+        code, networks = admin.request("GET", "/api/networks")
+        self.assertEqual(code, 200)
+        dmz = next(n for n in networks if n["cidr"] == "10.20.0.0/24")
+        iot = next(n for n in networks if n["cidr"] == "172.16.40.0/24")
+
+        code, dmz_data = admin.request("GET", f"/api/data?network_id={dmz['id']}")
+        self.assertEqual(code, 200)
+        self.assertEqual(dmz_data["session"]["subnet"], "10.20.0.0/24")
+        self.assertTrue(all(d["ip"].startswith("10.20.0.") for d in dmz_data["devices"]))
+
+        code, iot_data = admin.request("GET", f"/api/data?network_id={iot['id']}")
+        self.assertEqual(code, 200)
+        self.assertEqual(iot_data["session"]["subnet"], "172.16.40.0/24")
+        self.assertTrue(all(d["ip"].startswith("172.16.40.") for d in iot_data["devices"]))
+
+        # Invalid CIDR rejected
+        code, _ = admin.request("POST", "/api/networks", {"name": "Bad Net", "cidr": "not-a-cidr"})
+        self.assertEqual(code, 400)
+
+        # Add a new network (normalizes host IP to network CIDR)
+        code, created = admin.request(
+            "POST",
+            "/api/networks",
+            {
+                "name": "Serveurs Debian LAN55",
+                "cidr": "192.168.55.115/24",
+                "description": "Segment serveurs Debian",
+                "scan_interval_minutes": 45,
+                "port_range": "top-1000",
+            },
+        )
+        self.assertEqual(code, 201)
+        self.assertEqual(created["cidr"], "192.168.55.0/24")
+        net_id = created["id"]
+
+        # Duplicate CIDR rejected
+        code, _ = admin.request("POST", "/api/networks", {"name": "Dup", "cidr": "192.168.55.0/24"})
+        self.assertEqual(code, 409)
+
+        # Update network metadata
+        code, updated = admin.request(
+            "PUT",
+            f"/api/networks/{net_id}",
+            {"name": "LAN Debian 55", "enabled": False, "scan_interval_minutes": 15},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(updated["name"], "LAN Debian 55")
+        self.assertFalse(updated["enabled"])
+        self.assertEqual(updated["scan_interval_minutes"], 15)
+
+        # Trigger scan specifically for the new network
+        code, scan_res = admin.request("POST", f"/api/networks/{net_id}/scan")
+        self.assertEqual(code, 200)
+        new_sid = scan_res["session"]["id"]
+        self.assertEqual(scan_res["session"]["subnet"], "192.168.55.0/24")
+
+        # Delete network while preserving historical scans in DB (default purge_history=false)
+        code, del_res = admin.request("DELETE", f"/api/networks/{net_id}")
+        self.assertEqual(code, 200)
+        self.assertTrue(del_res["history_preserved"])
+
+        # Preserved scan session is still readable in SQLite
+        code, preserved = admin.request("GET", f"/api/data?session_id={new_sid}")
+        self.assertEqual(code, 200)
+        self.assertEqual(preserved["session"]["subnet"], "192.168.55.0/24")
 
 
 if __name__ == "__main__":

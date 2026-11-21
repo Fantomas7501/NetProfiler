@@ -18,9 +18,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-echo "[1/6] Installing system prerequisites (python3, python3-venv, python3-pip)..."
+echo "[1/6] Installing system prerequisites (python3, python3-venv, python3-pip, rsync, nmap)..."
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip rsync
+apt-get install -y -qq python3 python3-venv python3-pip rsync nmap
 
 echo "[2/6] Ensuring system user '${SERVICE_NAME}' and directories exist..."
 if ! id -u "${SERVICE_NAME}" >/dev/null 2>&1; then
@@ -55,6 +55,8 @@ NETPROFILER_ADMIN_USER=admin
 # NETPROFILER_ADMIN_PASSWORD=ChangeMeStrong!2026
 NETPROFILER_SESSION_TTL_HOURS=24
 NETPROFILER_COOKIE_SECURE=false
+# Set to true to execute real nmap scans when triggered from the UI:
+NETPROFILER_REAL_SCAN=false
 EOF
     chmod 600 "${ENV_FILE}"
 fi

@@ -9,6 +9,8 @@
     const state = {
         user: null,
         pwBannerDismissed: false,
+        networks: [],
+        currentNetworkId: null,
         sessions: [],
         currentSessionId: null,
         scanSession: null,
@@ -244,7 +246,7 @@
             window.location.hash = "#/map";
         }
 
-        await loadSessions();
+        await loadNetworks();
         renderCurrentRoute();
     }
 
@@ -273,11 +275,73 @@
     }
 
     // =========================================================================
-    // SCAN DATA LOADING
+    // NETWORKS & SCAN DATA LOADING
     // =========================================================================
+    function getCurrentNetwork() {
+        if (state.currentNetworkId === null) return null;
+        return state.networks.find((n) => String(n.id) === String(state.currentNetworkId)) || null;
+    }
+
+    async function loadNetworks(preferredNetworkId = null, preserveSessionId = null) {
+        try {
+            const nets = await apiFetch("/api/networks");
+            state.networks = Array.isArray(nets) ? nets : [];
+
+            const desired = preferredNetworkId !== null ? preferredNetworkId : state.currentNetworkId;
+            if (desired !== null && state.networks.some((n) => String(n.id) === String(desired))) {
+                state.currentNetworkId = Number(desired);
+            } else if (state.networks.length > 0) {
+                state.currentNetworkId = state.networks[0].id;
+            } else {
+                state.currentNetworkId = null;
+            }
+
+            await loadSessions(preserveSessionId);
+        } catch (err) {
+            showError(err.message || "Impossible de charger la liste des réseaux.");
+        }
+    }
+
+    async function selectNetwork(networkId, goToRoute = null) {
+        state.currentNetworkId = Number(networkId);
+        state.selectedAssetIp = null;
+        state.map.zoom = 1;
+        state.map.panX = 0;
+        state.map.panY = 0;
+        state.map.customPositions = {};
+        await loadSessions(null);
+        if (goToRoute) {
+            navigate(goToRoute);
+        } else {
+            renderCurrentRoute();
+        }
+    }
+
+    function updateChromeBadges() {
+        const net = getCurrentNetwork();
+        const subnet = net ? net.cidr : state.scanSession ? state.scanSession.subnet : "Aucun sous-réseau";
+        document.getElementById("sidebar-subnet").textContent = net ? `${net.name} • ${net.cidr}` : subnet;
+
+        if (state.scanSession) {
+            const label = net ? `${net.name} (${net.cidr})` : `Sous-réseau : ${state.scanSession.subnet}`;
+            document.getElementById("subnet-badge").textContent =
+                `${label} • Scan #${state.scanSession.id} • ${formatDate(state.scanSession.scan_time)}`;
+        } else if (net) {
+            document.getElementById("subnet-badge").textContent = `${net.name} (${net.cidr}) • Aucun scan enregistré`;
+        } else {
+            document.getElementById("subnet-badge").textContent = "Aucune session de scan";
+        }
+        document.getElementById("nav-badge-devices").textContent = state.stats.total_devices ?? 0;
+        document.getElementById("nav-badge-ports").textContent = state.stats.total_ports ?? 0;
+    }
+
     async function loadSessions(preserveSessionId = null) {
         try {
-            const sessions = await apiFetch("/api/sessions");
+            const qs =
+                state.currentNetworkId !== null
+                    ? `?network_id=${encodeURIComponent(state.currentNetworkId)}`
+                    : "";
+            const sessions = await apiFetch(`/api/sessions${qs}`);
             state.sessions = Array.isArray(sessions) ? sessions : [];
             const select = document.getElementById("session-select");
             select.innerHTML = "";
@@ -285,11 +349,20 @@
             if (state.sessions.length === 0) {
                 const opt = document.createElement("option");
                 opt.value = "";
-                opt.textContent = "Aucun scan disponible";
+                opt.textContent = "Aucun scan pour ce réseau";
                 select.appendChild(opt);
                 state.currentSessionId = null;
+                state.scanSession = null;
                 state.devices = [];
+                state.stats = {
+                    total_devices: 0,
+                    total_ports: 0,
+                    unique_services: 0,
+                    new_ports_count: 0,
+                    high_risk_ports: 0,
+                };
                 hideError();
+                updateChromeBadges();
                 return;
             }
 
@@ -317,8 +390,12 @@
 
     async function loadScanData(sessionId = null) {
         try {
-            const url = sessionId ? `/api/data?session_id=${encodeURIComponent(sessionId)}` : "/api/data";
-            const data = await apiFetch(url);
+            const params = new URLSearchParams();
+            if (sessionId) params.set("session_id", String(sessionId));
+            else if (state.currentNetworkId !== null) params.set("network_id", String(state.currentNetworkId));
+            const qs = params.toString() ? `?${params.toString()}` : "";
+
+            const data = await apiFetch(`/api/data${qs}`);
             hideError();
 
             state.currentSessionId = data.session ? data.session.id : sessionId;
@@ -333,14 +410,7 @@
             state.devices = data.devices || [];
             state.assetDetailCache = null;
 
-            // Update chrome badges
-            const subnet = state.scanSession ? state.scanSession.subnet : "Aucun sous-réseau";
-            document.getElementById("sidebar-subnet").textContent = subnet;
-            document.getElementById("subnet-badge").textContent = state.scanSession
-                ? `Sous-réseau : ${state.scanSession.subnet} • Scan #${state.scanSession.id} • ${formatDate(state.scanSession.scan_time)}`
-                : "Aucune session de scan";
-            document.getElementById("nav-badge-devices").textContent = state.stats.total_devices ?? 0;
-            document.getElementById("nav-badge-ports").textContent = state.stats.total_ports ?? 0;
+            updateChromeBadges();
         } catch (err) {
             showError(err.message || "Erreur lors du chargement des données du scan.");
         }
@@ -622,6 +692,9 @@
     function renderMapView() {
         const root = document.getElementById("view-root");
         const filtered = filterMapDevices();
+        const activeNet = getCurrentNetwork();
+        const isAdmin = state.user && state.user.role === "admin";
+        const canScan = state.user && (state.user.role === "admin" || state.user.role === "analyst");
 
         const categories = [
             { id: "all", label: "Tous" },
@@ -632,7 +705,70 @@
             { id: "iot", label: "IoT & Périph." },
         ];
 
+        const networkSelectorHtml =
+            state.networks.length > 0
+                ? `
+            <section class="network-selector-bar" aria-label="Sélection du réseau à cartographier">
+                <div class="network-selector-head">
+                    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                        <div>
+                            <h2 class="card-title" style="font-size:14px;">Carte du réseau affiché</h2>
+                            <p class="card-subtitle" style="font-size:12px;">Sélectionnez un réseau configuré pour afficher sa topologie et ses actifs découverts.</p>
+                        </div>
+                        <select id="map-network-select" class="select" style="width:270px; padding:6px 10px; font-size:12.5px;" aria-label="Choisir le réseau">
+                            ${state.networks
+                                .map(
+                                    (n) =>
+                                        `<option value="${n.id}" ${String(n.id) === String(state.currentNetworkId) ? "selected" : ""}>${esc(n.name)} (${esc(n.cidr)}) — ${n.last_hosts_up} actif(s)</option>`
+                                )
+                                .join("")}
+                        </select>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        ${
+                            canScan && activeNet
+                                ? `<button type="button" id="map-scan-network-btn" class="btn btn-secondary btn-sm">Scanner ce réseau</button>`
+                                : ""
+                        }
+                        ${
+                            isAdmin
+                                ? `<a href="#/config" class="btn btn-secondary btn-sm">+ Gérer les réseaux</a>`
+                                : ""
+                        }
+                    </div>
+                </div>
+
+                <div class="network-tab-grid">
+                    ${state.networks
+                        .map((n) => {
+                            const isActive = String(n.id) === String(state.currentNetworkId);
+                            return `
+                                <button type="button" class="network-tab ${isActive ? "active" : ""}" data-select-network="${n.id}">
+                                    <div class="network-tab-top">
+                                        <span class="network-tab-name">${esc(n.name)}</span>
+                                        <span class="badge ${n.enabled ? "badge-success" : "badge-neutral"}" style="font-size:10px;">${n.enabled ? "Actif" : "En pause"}</span>
+                                    </div>
+                                    <div class="network-tab-cidr">${esc(n.cidr)}</div>
+                                    <div class="network-tab-meta">
+                                        <span><strong style="color:var(--text-primary);">${n.last_hosts_up}</strong> actif(s) • <strong style="color:var(--accent-hover);">${n.last_ports_count}</strong> port(s)</span>
+                                        <span>${n.scan_count} scan(s)</span>
+                                    </div>
+                                </button>
+                            `;
+                        })
+                        .join("")}
+                </div>
+            </section>`
+                : `
+            <div class="banner banner-info">
+                <span>Aucun réseau configuré. ${isAdmin ? "Ajoutez un premier sous-réseau dans la page Configuration." : "Contactez un administrateur."}</span>
+                ${isAdmin ? `<a href="#/config" class="btn btn-sm btn-primary">Ajouter un réseau</a>` : ""}
+            </div>`;
+
         root.innerHTML = `
+            <!-- Network Selector -->
+            ${networkSelectorHtml}
+
             <!-- KPI Summary Row -->
             <div class="kpi-grid">
                 <div class="kpi-card">
@@ -723,7 +859,7 @@
             <section>
                 <div class="card-header" style="margin-bottom: 12px;">
                     <div>
-                        <h2 class="card-title">Accès rapide aux actifs découverts</h2>
+                        <h2 class="card-title">Accès rapide aux actifs découverts${activeNet ? ` — ${esc(activeNet.name)}` : ""}</h2>
                         <p class="card-subtitle">Cliquez sur une carte ou un nœud ci-dessus pour afficher le profilage complet des ports.</p>
                     </div>
                     <a href="#/query" class="btn btn-secondary btn-sm">Ouvrir la vue Requête &amp; Tableau →</a>
@@ -731,7 +867,11 @@
                 <div class="asset-strip-grid" id="map-asset-strip">
                     ${
                         filtered.length === 0
-                            ? `<div class="empty-state" style="grid-column:1/-1;">Aucun actif ne correspond aux filtres actifs.</div>`
+                            ? `<div class="empty-state" style="grid-column:1/-1;">
+                                   ${state.devices.length === 0
+                                       ? `Aucun actif enregistré pour ce réseau (${activeNet ? esc(activeNet.cidr) : "—"}). Lancez un scan pour découvrir les hôtes.`
+                                       : "Aucun actif ne correspond aux filtres actifs."}
+                               </div>`
                             : filtered
                                   .map((dev) => {
                                       const st = getAssetStatus(dev);
@@ -761,6 +901,36 @@
                 </div>
             </section>
         `;
+
+        // Wire network selector controls
+        const netSelect = document.getElementById("map-network-select");
+        if (netSelect) {
+            netSelect.addEventListener("change", (e) => {
+                selectNetwork(e.target.value);
+            });
+        }
+        document.querySelectorAll("[data-select-network]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                selectNetwork(btn.dataset.selectNetwork);
+            });
+        });
+        const mapScanBtn = document.getElementById("map-scan-network-btn");
+        if (mapScanBtn && activeNet) {
+            mapScanBtn.addEventListener("click", async () => {
+                mapScanBtn.disabled = true;
+                mapScanBtn.textContent = "Scan en cours...";
+                try {
+                    const res = await apiFetch(`/api/networks/${activeNet.id}/scan`, { method: "POST" });
+                    showToast(`Scan #${res.session.id} enregistré pour ${activeNet.name}.`, "success");
+                    await loadNetworks(activeNet.id, res.session.id);
+                    renderCurrentRoute();
+                } catch (err) {
+                    showToast(err.message, "error");
+                    mapScanBtn.disabled = false;
+                    mapScanBtn.textContent = "Scanner ce réseau";
+                }
+            });
+        }
 
         // Wire toolbar controls
         document.getElementById("map-search").addEventListener("input", (e) => {
@@ -1792,6 +1962,18 @@
 
             <!-- Search, Filter, View Mode & Export Bar -->
             <div class="toolbar-bar">
+                ${
+                    state.networks.length > 0
+                        ? `<select id="query-network-select" class="select" style="width:230px;" aria-label="Réseau affiché">
+                               ${state.networks
+                                   .map(
+                                       (n) =>
+                                           `<option value="${n.id}" ${String(n.id) === String(state.currentNetworkId) ? "selected" : ""}>${esc(n.name)} (${esc(n.cidr)})</option>`
+                                   )
+                                   .join("")}
+                           </select>`
+                        : ""
+                }
                 <div class="search-box">
                     <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
@@ -1820,15 +2002,26 @@
             ${bodyHtml}
         `;
 
+        const qNetSelect = document.getElementById("query-network-select");
+        if (qNetSelect) {
+            qNetSelect.addEventListener("change", (e) => {
+                selectNetwork(e.target.value);
+            });
+        }
+
         document.getElementById("query-search-input").addEventListener("input", (e) => {
             state.query.search = e.target.value;
             renderQueryView();
             const inp = document.getElementById("query-search-input");
             if (inp) {
                 inp.focus();
-                inp.setSelectionRange(inp.value.length, inp.value.length);
+                inputFocusEnd(inp);
             }
         });
+
+        function inputFocusEnd(inp) {
+            inp.setSelectionRange(inp.value.length, inp.value.length);
+        }
 
         document.getElementById("query-open-only").addEventListener("change", (e) => {
             state.query.openOnly = e.target.checked;
@@ -2146,7 +2339,12 @@
     async function renderConfigView() {
         const root = document.getElementById("view-root");
         try {
-            state.config = await apiFetch("/api/config");
+            const [cfgData, netsData] = await Promise.all([
+                apiFetch("/api/config"),
+                apiFetch("/api/networks"),
+            ]);
+            state.config = cfgData;
+            state.networks = Array.isArray(netsData) ? netsData : [];
         } catch (err) {
             showError(err.message);
             return;
@@ -2160,18 +2358,102 @@
         root.innerHTML = `
             ${
                 !isAdmin
-                    ? `<div class="banner banner-info"><span>Mode lecture seule : seuls les administrateurs peuvent modifier la configuration globale.</span></div>`
+                    ? `<div class="banner banner-info"><span>Mode lecture seule : seuls les administrateurs peuvent ajouter ou modifier les réseaux et la configuration globale.</span></div>`
                     : ""
             }
 
+            <!-- Multi-Network Management Card -->
+            <section class="card" aria-label="Gestion des réseaux à scanner">
+                <div class="card-header">
+                    <div>
+                        <h3 class="card-title">Réseaux à scanner (${state.networks.length})</h3>
+                        <p class="card-subtitle">Ajoutez et gérez les sous-réseaux CIDR surveillés. Toutes les données et actifs découverts de chaque réseau sont conservés en base SQLite.</p>
+                    </div>
+                    ${
+                        isAdmin
+                            ? `<button type="button" id="add-network-btn" class="btn btn-primary">+ Ajouter un réseau</button>`
+                            : ""
+                    }
+                </div>
+
+                ${
+                    state.networks.length === 0
+                        ? `<div class="empty-state" style="background:var(--bg-inset);">Aucun réseau configuré pour le moment.</div>`
+                        : `
+                <div class="table-wrap">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Réseau</th>
+                                <th>CIDR &amp; Cadence</th>
+                                <th>Statut</th>
+                                <th>Données en base</th>
+                                <th style="text-align:right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${state.networks
+                                .map((n) => {
+                                    return `
+                                        <tr>
+                                            <td>
+                                                <div style="font-weight:600;">${esc(n.name)}</div>
+                                                ${
+                                                    n.description
+                                                        ? `<div style="font-size:11.5px; color:var(--text-muted); max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(n.description)}">${esc(n.description)}</div>`
+                                                        : ""
+                                                }
+                                            </td>
+                                            <td style="white-space:nowrap;">
+                                                <div class="mono" style="font-weight:600; color:var(--accent-hover);">${esc(n.cidr)}</div>
+                                                <div style="font-size:11.5px; color:var(--text-muted);">${n.scan_interval_minutes} min • ${esc(n.port_range)}</div>
+                                            </td>
+                                            <td>
+                                                <span class="badge ${n.enabled ? "badge-success" : "badge-neutral"}">
+                                                    ${n.enabled ? "Actif" : "En pause"}
+                                                </span>
+                                            </td>
+                                            <td style="font-size:12.5px; white-space:nowrap;">
+                                                <div>
+                                                    <span class="mono" style="font-weight:600;">${n.last_hosts_up}</span> actif(s) •
+                                                    <span class="mono" style="color:var(--accent-hover);">${n.last_ports_count}</span> port(s)
+                                                    <span style="color:var(--text-muted);">(${n.scan_count} scan${n.scan_count > 1 ? "s" : ""})</span>
+                                                </div>
+                                                <div style="font-size:11.5px; color:var(--text-muted);">Dernier : ${formatDate(n.last_scan_time)}</div>
+                                            </td>
+                                            <td style="text-align:right; white-space:nowrap;">
+                                                <button type="button" class="btn btn-secondary btn-sm" data-view-net-map="${n.id}" title="Afficher la carte de ce réseau">Carte</button>
+                                                ${
+                                                    canScan
+                                                        ? `<button type="button" class="btn btn-secondary btn-sm" style="margin-left:4px;" data-scan-net="${n.id}">Scanner</button>`
+                                                        : ""
+                                                }
+                                                ${
+                                                    isAdmin
+                                                        ? `<button type="button" class="btn btn-secondary btn-sm" style="margin-left:4px;" data-edit-net="${n.id}">Modifier</button>
+                                                           <button type="button" class="btn btn-danger btn-sm" style="margin-left:4px;" data-del-net="${n.id}">Supprimer</button>`
+                                                        : ""
+                                                }
+                                            </td>
+                                        </tr>
+                                    `;
+                                })
+                                .join("")}
+                        </tbody>
+                    </table>
+                </div>`
+                }
+            </section>
+
+            <!-- Global Scanner & Platform Settings -->
             <form id="config-form" style="display:flex; flex-direction:column; gap:18px;">
                 <div class="two-col-grid">
-                    <!-- Scanner Configuration -->
+                    <!-- Scanner Default Profile -->
                     <section class="card">
                         <div class="card-header">
                             <div>
-                                <h3 class="card-title">Paramètres du scanner réseau</h3>
-                                <p class="card-subtitle">Cible CIDR, cadence de découverte et profondeur du profilage Nmap.</p>
+                                <h3 class="card-title">Paramètres par défaut du scanner</h3>
+                                <p class="card-subtitle">Valeurs par défaut proposées lors de l'ajout d'un nouveau réseau.</p>
                             </div>
                         </div>
 
@@ -2182,18 +2464,18 @@
 
                         <div class="form-grid-2">
                             <div class="form-group">
-                                <label class="form-label" for="cfg-subnet">Sous-réseau cible (CIDR)</label>
+                                <label class="form-label" for="cfg-subnet">Sous-réseau par défaut (CIDR)</label>
                                 <input id="cfg-subnet" type="text" class="input mono" value="${esc(cfg.target_subnet || "")}" placeholder="192.168.10.0/24" ${dis}>
                             </div>
                             <div class="form-group">
-                                <label class="form-label" for="cfg-interval">Intervalle de scan (minutes)</label>
+                                <label class="form-label" for="cfg-interval">Intervalle par défaut (minutes)</label>
                                 <input id="cfg-interval" type="number" min="5" max="1440" class="input mono" value="${esc(cfg.scan_interval_minutes || "60")}" ${dis}>
                             </div>
                         </div>
 
                         <div class="form-grid-2">
                             <div class="form-group">
-                                <label class="form-label" for="cfg-ports">Plage de ports</label>
+                                <label class="form-label" for="cfg-ports">Plage de ports par défaut</label>
                                 <select id="cfg-ports" class="select" ${dis}>
                                     <option value="top-100" ${cfg.port_range === "top-100" ? "selected" : ""}>Top 100 ports (rapide)</option>
                                     <option value="top-1000" ${cfg.port_range === "top-1000" ? "selected" : ""}>Top 1000 ports (standard)</option>
@@ -2201,7 +2483,7 @@
                                 </select>
                             </div>
                             <div class="form-group">
-                                <label class="form-label" for="cfg-flags">Options Nmap</label>
+                                <label class="form-label" for="cfg-flags">Options Nmap par défaut</label>
                                 <input id="cfg-flags" type="text" class="input mono" value="${esc(cfg.nmap_flags || "")}" ${dis}>
                             </div>
                         </div>
@@ -2255,10 +2537,10 @@
 
                         <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--border-subtle); display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
                             <div>
-                                <div style="font-size:13px; font-weight:600;">Déclenchement manuel</div>
-                                <div style="font-size:12px; color:var(--text-muted);">Enregistre un nouvel instantané dans l'historique des scans.</div>
+                                <div style="font-size:13px; font-weight:600;">Scan rapide du réseau actif</div>
+                                <div style="font-size:12px; color:var(--text-muted);">Enregistre un nouvel instantané pour le réseau actuellement sélectionné.</div>
                             </div>
-                            <button type="button" id="trigger-scan-btn" class="btn btn-secondary" ${canScan ? "" : "disabled"}>
+                            <button type="button" id="trigger-scan-btn" class="btn btn-secondary" ${canScan && state.networks.length > 0 ? "" : "disabled"}>
                                 Lancer un scan maintenant
                             </button>
                         </div>
@@ -2268,12 +2550,57 @@
                 ${
                     isAdmin
                         ? `<div style="display:flex; justify-content:flex-end; gap:10px;">
-                               <button type="submit" class="btn btn-primary">Enregistrer la configuration</button>
+                               <button type="submit" class="btn btn-primary">Enregistrer les paramètres globaux</button>
                            </div>`
                         : ""
                 }
             </form>
         `;
+
+        // Wire Network Management Actions
+        const addNetBtn = document.getElementById("add-network-btn");
+        if (addNetBtn) {
+            addNetBtn.addEventListener("click", () => openNetworkModal(null));
+        }
+
+        document.querySelectorAll("[data-view-net-map]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                selectNetwork(btn.dataset.viewNetMap, "#/map");
+            });
+        });
+
+        document.querySelectorAll("[data-scan-net]").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+                const netId = Number(btn.dataset.scanNet);
+                const net = state.networks.find((n) => n.id === netId);
+                btn.disabled = true;
+                btn.textContent = "Scan...";
+                try {
+                    const res = await apiFetch(`/api/networks/${netId}/scan`, { method: "POST" });
+                    showToast(`Scan #${res.session.id} enregistré pour ${net ? net.name : "le réseau"}.`, "success");
+                    await loadNetworks(state.currentNetworkId, state.currentSessionId);
+                    renderConfigView();
+                } catch (err) {
+                    showToast(err.message, "error");
+                    btn.disabled = false;
+                    btn.textContent = "Scanner";
+                }
+            });
+        });
+
+        document.querySelectorAll("[data-edit-net]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const target = state.networks.find((n) => String(n.id) === btn.dataset.editNet);
+                if (target) openNetworkModal(target);
+            });
+        });
+
+        document.querySelectorAll("[data-del-net]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const target = state.networks.find((n) => String(n.id) === btn.dataset.delNet);
+                if (target) openDeleteNetworkModal(target);
+            });
+        });
 
         if (isAdmin) {
             document.getElementById("config-form").addEventListener("submit", async (e) => {
@@ -2309,17 +2636,177 @@
                 triggerBtn.disabled = true;
                 triggerBtn.textContent = "Scan en cours...";
                 try {
-                    const res = await apiFetch("/api/scan/trigger", { method: "POST" });
+                    const res = await apiFetch("/api/scan/trigger", {
+                        method: "POST",
+                        body: JSON.stringify({ network_id: state.currentNetworkId }),
+                    });
                     showToast(`Nouveau scan #${res.session.id} enregistré.`, "success");
-                    await loadSessions(res.session.id);
+                    await loadNetworks(res.session.network_id || state.currentNetworkId, res.session.id);
+                    renderConfigView();
                 } catch (err) {
                     showToast(err.message, "error");
-                } finally {
                     triggerBtn.disabled = false;
                     triggerBtn.textContent = "Lancer un scan maintenant";
                 }
             });
         }
+    }
+
+    function openNetworkModal(existingNet) {
+        const isEdit = Boolean(existingNet);
+        const cfg = state.config || {};
+        const title = isEdit ? `Modifier le réseau — ${existingNet.name}` : "Ajouter un réseau à scanner";
+
+        openModal(`
+            <div class="modal-header">
+                <h3>${esc(title)}</h3>
+                <button type="button" class="btn btn-ghost btn-icon" data-close-modal aria-label="Fermer">✕</button>
+            </div>
+            <form id="network-modal-form">
+                <div class="modal-body">
+                    <div id="net-modal-err" class="banner banner-danger hidden" style="margin-bottom:14px;"></div>
+
+                    <div class="form-grid-2">
+                        <div class="form-group">
+                            <label class="form-label" for="net-name">Nom du réseau *</label>
+                            <input id="net-name" type="text" class="input" required minlength="2" maxlength="80" value="${esc(isEdit ? existingNet.name : "")}" placeholder="Ex: VLAN Serveurs Debian">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="net-cidr">Sous-réseau CIDR *</label>
+                            <input id="net-cidr" type="text" class="input mono" required value="${esc(isEdit ? existingNet.cidr : "")}" placeholder="192.168.55.0/24">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="net-desc">Description</label>
+                        <input id="net-desc" type="text" class="input" maxlength="300" value="${esc(isEdit ? existingNet.description : "")}" placeholder="Zone, bâtiment, VLAN ou rôle du réseau...">
+                    </div>
+
+                    <div class="form-grid-2">
+                        <div class="form-group">
+                            <label class="form-label" for="net-interval">Intervalle de scan (min)</label>
+                            <input id="net-interval" type="number" min="5" max="1440" class="input mono" value="${esc(isEdit ? existingNet.scan_interval_minutes : cfg.scan_interval_minutes || 60)}">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="net-ports">Plage de ports</label>
+                            <select id="net-ports" class="select">
+                                ${["top-100", "top-1000", "1-65535"]
+                                    .map((opt) => {
+                                        const cur = isEdit ? existingNet.port_range : cfg.port_range || "top-1000";
+                                        const labels = {
+                                            "top-100": "Top 100 ports (rapide)",
+                                            "top-1000": "Top 1000 ports (standard)",
+                                            "1-65535": "Tous les ports TCP (1-65535)",
+                                        };
+                                        return `<option value="${opt}" ${cur === opt ? "selected" : ""}>${labels[opt]}</option>`;
+                                    })
+                                    .join("")}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="net-flags">Options Nmap</label>
+                        <input id="net-flags" type="text" class="input mono" value="${esc(isEdit ? existingNet.nmap_flags : cfg.nmap_flags || "-sV -O --version-intensity 5 -T4")}">
+                    </div>
+
+                    <div style="margin-top:8px;">
+                        <label class="switch">
+                            <input id="net-enabled" type="checkbox" ${!isEdit || existingNet.enabled ? "checked" : ""}>
+                            <span class="switch-track"></span>
+                            <span>Scan automatique activé pour ce réseau</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-close-modal>Annuler</button>
+                    <button type="submit" class="btn btn-primary">${isEdit ? "Enregistrer" : "Ajouter le réseau"}</button>
+                </div>
+            </form>
+        `);
+
+        document.getElementById("network-modal-form").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const errBox = document.getElementById("net-modal-err");
+            errBox.classList.add("hidden");
+
+            const payload = {
+                name: document.getElementById("net-name").value.trim(),
+                cidr: document.getElementById("net-cidr").value.trim(),
+                description: document.getElementById("net-desc").value.trim(),
+                scan_interval_minutes: Number(document.getElementById("net-interval").value),
+                port_range: document.getElementById("net-ports").value,
+                nmap_flags: document.getElementById("net-flags").value.trim(),
+                enabled: document.getElementById("net-enabled").checked,
+            };
+
+            try {
+                if (isEdit) {
+                    await apiFetch(`/api/networks/${existingNet.id}`, {
+                        method: "PUT",
+                        body: JSON.stringify(payload),
+                    });
+                    showToast(`Réseau '${payload.name}' mis à jour.`, "success");
+                    await loadNetworks(state.currentNetworkId, state.currentSessionId);
+                } else {
+                    const created = await apiFetch("/api/networks", {
+                        method: "POST",
+                        body: JSON.stringify(payload),
+                    });
+                    showToast(`Réseau '${created.name}' (${created.cidr}) ajouté.`, "success");
+                    await loadNetworks(state.currentNetworkId || created.id, state.currentSessionId);
+                }
+                closeModal();
+                renderConfigView();
+            } catch (err) {
+                errBox.textContent = err.message;
+                errBox.classList.remove("hidden");
+            }
+        });
+    }
+
+    function openDeleteNetworkModal(target) {
+        openModal(`
+            <div class="modal-header">
+                <h3>Retirer le réseau</h3>
+                <button type="button" class="btn btn-ghost btn-icon" data-close-modal aria-label="Fermer">✕</button>
+            </div>
+            <div class="modal-body">
+                <p style="margin:0 0 14px; color:var(--text-secondary);">
+                    Voulez-vous retirer <strong style="color:var(--text-primary);">${esc(target.name)}</strong> (<span class="mono">${esc(target.cidr)}</span>) de la liste des réseaux à scanner ?
+                </p>
+                <label class="switch">
+                    <input id="net-keep-history" type="checkbox" checked>
+                    <span class="switch-track"></span>
+                    <span>Conserver les scans et actifs découverts dans la base de données</span>
+                </label>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-close-modal>Annuler</button>
+                <button type="button" id="confirm-del-net" class="btn btn-danger">Supprimer le réseau</button>
+            </div>
+        `);
+
+        document.getElementById("confirm-del-net").addEventListener("click", async () => {
+            const keepHistory = document.getElementById("net-keep-history").checked;
+            try {
+                await apiFetch(`/api/networks/${target.id}?purge_history=${keepHistory ? "false" : "true"}`, {
+                    method: "DELETE",
+                });
+                closeModal();
+                showToast(
+                    keepHistory
+                        ? `Réseau '${target.name}' retiré (historique conservé en base).`
+                        : `Réseau '${target.name}' et son historique supprimés.`,
+                    "success"
+                );
+                const nextNet = state.currentNetworkId === target.id ? null : state.currentNetworkId;
+                await loadNetworks(nextNet);
+                renderConfigView();
+            } catch (err) {
+                showToast(err.message, "error");
+            }
+        });
     }
 
     // =========================================================================
@@ -2542,13 +3029,14 @@
 
         // Scan session selector
         document.getElementById("session-select").addEventListener("change", async (e) => {
+            if (!e.target.value) return;
             await loadScanData(e.target.value);
             renderCurrentRoute();
         });
 
         // Refresh button
         document.getElementById("refresh-btn").addEventListener("click", async () => {
-            await loadSessions(state.currentSessionId);
+            await loadNetworks(state.currentNetworkId, state.currentSessionId);
             renderCurrentRoute();
             showToast("Données actualisées.", "info");
         });
